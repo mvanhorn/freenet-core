@@ -37,6 +37,8 @@ use tokio::sync::Mutex;
 // Test Configuration
 // =============================================================================
 
+const NIGHTLY_TOPOLOGY_MAX_CONNECTIONS: usize = freenet::dev_tool::NN_LATTICE_MIN_MAX_CONNECTIONS;
+
 /// Configuration for a simulation test.
 struct TestConfig {
     name: &'static str,
@@ -10574,6 +10576,15 @@ fn test_get_reliability_with_churn() {
     }
 }
 
+#[test]
+fn nightly_topology_max_connections_meets_lattice_activation_floor() {
+    assert_eq!(
+        NIGHTLY_TOPOLOGY_MAX_CONNECTIONS,
+        freenet::dev_tool::NN_LATTICE_MIN_MAX_CONNECTIONS,
+        "nightly topology formation must run at the lattice activation boundary"
+    );
+}
+
 /// Nightly: 50-node topology formation with strict connectivity assertions.
 ///
 /// Verifies that a 50-node network converges to `min_connections` within 1 virtual hour.
@@ -10594,7 +10605,6 @@ async fn test_nightly_50_node_topology_formation() {
     const NODES: usize = 50;
     const RING_MAX_HTL: usize = 10;
     const RND_IF_HTL_ABOVE: usize = 5;
-    const MAX_CONN: usize = 20;
     const MIN_CONN: usize = 10;
     const VIRTUAL_DURATION: Duration = Duration::from_secs(3600); // 1 hour
 
@@ -10608,7 +10618,7 @@ async fn test_nightly_50_node_topology_formation() {
         NODES,
         RING_MAX_HTL,
         RND_IF_HTL_ABOVE,
-        MAX_CONN,
+        NIGHTLY_TOPOLOGY_MAX_CONNECTIONS,
         MIN_CONN,
         SEED,
     )

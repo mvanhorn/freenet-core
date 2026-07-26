@@ -113,6 +113,9 @@ pub mod dev_tool {
     // benefit-test cleanup guard). No-op in production builds (compiled out).
     #[cfg(any(test, feature = "testing"))]
     pub use ring::{set_nn_lattice_enabled, set_nn_lattice_force_active};
+    /// Minimum configured connection budget that activates the nearest-neighbor lattice.
+    #[cfg(any(test, feature = "testing"))]
+    pub const NN_LATTICE_MIN_MAX_CONNECTIONS: usize = crate::ring::Ring::DEFAULT_MIN_CONNECTIONS;
 
     // Test-only findability measurement harness (NOT for ship): scatter/cache
     // disable hook (guarantees a single copy) + per-op terminus tracing (rank /
