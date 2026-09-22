@@ -46,9 +46,19 @@ permissions:
   contents: read
 
 concurrency:
-  # On release-trigger the version is in github.event.release.tag_name;
-  # on workflow_dispatch it's in inputs.version. The `||` coalesces.
-  group: gateway-update-${{ github.event.release.tag_name || inputs.version }}
+  # Shared with the Gate B job auto-update-selfupdate-canary in
+  # cross-compile.yml. One repository-wide literal, on purpose: a tag,
+  # version, run, or workflow suffix splits the lock, and every release plus
+  # every manual rollout restarts the same physical gateways. Workflow-level
+  # so planning, the restart, and the convergence check are all inside it.
+  #
+  # Either operation may run first. This is mutual exclusion, not a queue:
+  # GitHub does not promise FIFO, and with cancel-in-progress false a newer
+  # pending run can still replace an older pending one. A cancelled Gate B is
+  # not a verified release. Do not `needs` that job from here -- a gateway
+  # recovery must not wait on a green canary. The release event trigger stays;
+  # this group does not decide who is allowed to roll out.
+  group: freenet-release-gateways
   cancel-in-progress: false
 
 jobs:

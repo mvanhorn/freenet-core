@@ -667,11 +667,25 @@ boot_count_for() {
     : > "$counter"
     make_fake_node "$work/bin/freenet" 0 "$extra"
     # Count a boot on every invocation that is not `--version`.
-    sed -i "2i if [ \"\${1:-}\" != \"--version\" ]; then echo x >> \"$counter\"; fi" \
-        "$work/bin/freenet"
+    # Inserted without `sed -i`: BSD sed rejects that and GNU's `2i` form, so
+    # this case reported 0 boots on macOS while CI (GNU sed) passed. The count
+    # is the assertion; the editor is not.
+    {
+        head -n 1 "$work/bin/freenet"
+        printf '%s\n' "if [ \"\${1:-}\" != \"--version\" ]; then echo x >> \"$counter\"; fi"
+        tail -n +2 "$work/bin/freenet"
+    } > "$work/bin/freenet.counted"
+    mv "$work/bin/freenet.counted" "$work/bin/freenet"
+    chmod +x "$work/bin/freenet"
     (
         curl() { :; }
         tar()  { :; }
+        # Download is mocked above. Readiness is a different observation and
+        # must be mocked explicitly: a no-op curl is not "the expected tag is
+        # published", and CANARY_EXPECTED_LATEST is not that evidence either.
+        # These two cases are the node-retry loop, which runs only after the
+        # redirect already serves the release under test.
+        await_publication_ready() { return 0; }
         cmd_selfupdate 0.2.121 0.2.122 >/dev/null 2>&1
     )
     grep -c x "$counter" 2>/dev/null || echo 0
@@ -705,6 +719,419 @@ fi
 CANARY_ATTEMPTS="$SAVED_ATTEMPTS"
 CANARY_RETRY_SLEEP="$SAVED_SLEEP"
 CANARY_OUTCOME_WAIT_SECS="$SAVED_OUTCOME"
+
+# ---------------------------------------------------------------------------
+# 11. Publication readiness (#5715), through the real cmd_selfupdate.
+#
+#     Gate B used to boot the previous binary immediately. GitHub's public
+#     /releases/latest redirect can still name the previous tag for a short
+#     window after publication, and the canary then scored that stale
+#     observation as a broken comparator. v0.2.136 failed that way; the same
+#     binary saw the new release on its own afterwards.
+#
+#     These cases mock the redirect. They do not prove live CDN propagation.
+#     CANARY_EXPECTED_LATEST is preset in this file and is deliberately NOT
+#     treated as evidence: each case says what the redirect returned.
+# ---------------------------------------------------------------------------
+PUBDIR="$TMPROOT/publication"
+mkdir -p "$PUBDIR"
+
+# run_publication <prev> <expected> <kind> <budget> <poll> <attempts> <preset> <resp...>
+#
+# kind selects the fake node's behaviour AFTER a boot. Exhaustion cases use
+# `success` on purpose: if the wait is skipped, that fake makes Gate B report
+# OK, which is the false green these cases exist to reject.
+run_publication() {
+    local prev="$1" expected="$2" kind="$3" budget="$4" poll="$5" attempts="$6" preset="$7"
+    shift 7
+    local resp logbody node_exit flip state bin
+    rm -rf "$PUBDIR"
+    mkdir -p "$PUBDIR"
+    : > "$PUBDIR/responses"
+    for resp in "$@"; do
+        printf '%s\n' "$resp" >> "$PUBDIR/responses"
+    done
+    : > "$PUBDIR/probes"
+    : > "$PUBDIR/args"
+    : > "$PUBDIR/events"
+    : > "$PUBDIR/boots"
+    printf '0\n' > "$PUBDIR/idx"
+    state="$PUBDIR/updated"
+    bin="$CANARY_WORKDIR/selfupdate/bin/freenet"
+    rm -rf "$CANARY_WORKDIR/selfupdate"
+    mkdir -p "$CANARY_WORKDIR/selfupdate/bin"
+    flip=0
+    node_exit=0
+    logbody="2026-08-08T02:00:00.000000Z  $CHECK_LINE"
+    case "$kind" in
+        success)
+            flip=1
+            node_exit=42
+            logbody="$logbody
+2026-08-08T02:00:00.100000Z  INFO freenet::commands::auto_update: Startup update check: GitHub reports latest release latest=$expected
+2026-08-08T02:00:00.200000Z  $TRIGGER_LINE"
+            ;;
+        success-old)
+            flip=1
+            node_exit=42
+            logbody="$logbody
+2026-08-08T02:00:00.200000Z  $TRIGGER_LINE"
+            ;;
+        wrong-final)
+            flip=0
+            node_exit=42
+            logbody="$logbody
+2026-08-08T02:00:00.100000Z  INFO freenet::commands::auto_update: Startup update check: GitHub reports latest release latest=$expected
+2026-08-08T02:00:00.200000Z  $TRIGGER_LINE"
+            ;;
+        wrong-latest)
+            logbody="$logbody
+2026-08-08T02:00:00.100000Z  INFO freenet::commands::auto_update: Startup update check: GitHub reports latest release latest=0.2.1
+2026-08-08T02:00:00.200000Z  $COMPLETE_LINE"
+            ;;
+        parse-fail)
+            logbody="$logbody
+2026-08-08T02:00:00.100000Z  $PARSE_FAIL_LINE"
+            ;;
+        fetch-fail)
+            logbody="$logbody
+2026-08-08T02:00:00.100000Z  WARN freenet::commands::auto_update: Startup update check: failed to fetch latest version: error sending request. Continuing with current binary."
+            ;;
+        *)
+            bad "run_publication: unknown kind '$kind'"
+            return
+            ;;
+    esac
+    cat > "$bin" <<EOF
+#!/usr/bin/env bash
+if [ "\${1:-}" = "--version" ]; then
+    echo version >> "$PUBDIR/events"
+    if [ -f "$state" ]; then
+        echo "Freenet version: $expected (deadbeefcafe)"
+    else
+        echo "Freenet version: $prev (deadbeefcafe)"
+    fi
+    exit 0
+fi
+if [ "\${1:-}" = "update" ]; then
+    echo update >> "$PUBDIR/events"
+    if [ "$flip" = "1" ]; then
+        : > "$state"
+    fi
+    exit 0
+fi
+if [ "\${1:-}" = "network" ]; then
+    n=\$(wc -l < "$PUBDIR/probes" | tr -d ' ')
+    echo "boot-at=\$n" >> "$PUBDIR/boots"
+    logdir=""
+    while [ \$# -gt 0 ]; do
+        case "\$1" in
+            --log-dir) logdir="\$2"; shift 2 ;;
+            *) shift ;;
+        esac
+    done
+    mkdir -p "\$logdir"
+    cat >> "\$logdir/freenet.2026-08-08-02.log" <<'LOG'
+$logbody
+LOG
+    exit $node_exit
+fi
+echo "unexpected \$*" >> "$PUBDIR/events"
+exit 99
+EOF
+    chmod +x "$bin"
+    local started ended
+    started=$(date +%s)
+    (
+        # shellcheck disable=SC2317  # invoked by cmd_selfupdate, not from here
+        curl() {
+            local prev="" arg saw_w=0 saw_latest=0 max_time="" retries="" url=""
+            for arg in "$@"; do
+                case "$prev" in
+                    --max-time) max_time="$arg" ;;
+                    --retry) retries="$arg" ;;
+                esac
+                case "$arg" in
+                    -w) saw_w=1 ;;
+                    "$RELEASES_LATEST_URL") saw_latest=1; url="$arg" ;;
+                    *api.github.com*) url="$arg" ;;
+                    http*) url="$arg" ;;
+                esac
+                prev="$arg"
+            done
+            if [ "$saw_latest" -eq 1 ] && [ "$saw_w" -eq 1 ]; then
+                local n total line
+                n=$(cat "$PUBDIR/idx")
+                total=$(grep -c . "$PUBDIR/responses" || true)
+                if [ "$total" -lt 1 ]; then
+                    echo "no scripted responses" >> "$PUBDIR/args"
+                    return 1
+                fi
+                if [ "$n" -ge "$total" ]; then
+                    n=$((total - 1))
+                fi
+                line=$(sed -n "$((n + 1))p" "$PUBDIR/responses")
+                printf '%s\n' "$((n + 1))" > "$PUBDIR/idx"
+                printf '%s\n' "$line" >> "$PUBDIR/probes"
+                printf 'retry=%s max=%s url=%s\n' "$retries" "$max_time" "$url" >> "$PUBDIR/args"
+                case "$line" in
+                    fail)
+                        return 28 ;;
+                    missing)
+                        return 0 ;;
+                    malformed)
+                        printf '%s' 'https://github.com/freenet/freenet-core/not-a-release'
+                        return 0 ;;
+                    badtag\ *)
+                        printf '%s' "https://github.com/freenet/freenet-core/releases/tag/${line#badtag }"
+                        return 0 ;;
+                    tag\ *)
+                        printf '%s' "https://github.com/freenet/freenet-core/releases/tag/v${line#tag }"
+                        return 0 ;;
+                    *)
+                        printf 'bad response %s\n' "$line" >> "$PUBDIR/args"
+                        return 1 ;;
+                esac
+            fi
+            return 0
+        }
+        tar() { :; }
+        CANARY_ATTEMPTS="$attempts"
+        CANARY_RETRY_SLEEP=0
+        CANARY_OUTCOME_WAIT_SECS=2
+        CANARY_PUBLICATION_READY_SECS="$budget"
+        CANARY_PUBLICATION_POLL_SECS="$poll"
+        if [ -n "$preset" ]; then
+            export CANARY_EXPECTED_LATEST="$preset"
+        fi
+        cmd_selfupdate "$prev" "$expected" >"$PUBDIR/out" 2>"$PUBDIR/err"
+        printf '%s\n' "$?" > "$PUBDIR/rc"
+        printf '%s\n' "${CANARY_EXPECTED_LATEST-}" > "$PUBDIR/target"
+    )
+    ended=$(date +%s)
+    printf '%s\n' "$((ended - started))" > "$PUBDIR/elapsed"
+}
+
+pub_rc() { cat "$PUBDIR/rc" 2>/dev/null || echo missing; }
+pub_boots() { grep -c '^boot-at=' "$PUBDIR/boots" 2>/dev/null || true; }
+pub_boot_at() { sed -n 's/^boot-at=//p' "$PUBDIR/boots" | head -1; }
+pub_probes() { grep -c . "$PUBDIR/probes" 2>/dev/null || true; }
+pub_err() { cat "$PUBDIR/err" 2>/dev/null || true; }
+pub_out() { cat "$PUBDIR/out" 2>/dev/null || true; }
+
+# Assert every readiness request was one shot against the public redirect,
+# with --retry 0 (or no retry flag) and --max-time no larger than the budget.
+assert_probe_bounds() {
+    local desc="$1" budget="$2" min_n="$3" max_n="$4" n line retry max url
+    n=$(pub_probes)
+    n=${n:-0}
+    if [ "$n" -lt "$min_n" ] || [ "$n" -gt "$max_n" ]; then
+        bad "$desc: $n readiness request(s), wanted $min_n..$max_n"
+        return
+    fi
+    while IFS= read -r line; do
+        retry=${line#*retry=}; retry=${retry%% *}; max=${line#*max=}; max=${max%% *}; url=${line#*url=}
+        case "$retry" in
+            ''|0) ;;
+            *) bad "$desc: inner retry '$retry' (a Gate A retry sequence inside the deadline)"; return ;;
+        esac
+        case "$max" in
+            ''|*[!0-9]*) bad "$desc: max-time '$max' is not a positive integer"; return ;;
+        esac
+        if [ "$max" -lt 1 ] || [ "$max" -gt "$budget" ]; then
+            bad "$desc: max-time $max is outside 1..$budget"
+            return
+        fi
+        if [ "$url" != "$RELEASES_LATEST_URL" ]; then
+            bad "$desc: probe URL '$url' is not $RELEASES_LATEST_URL"
+            return
+        fi
+    done < "$PUBDIR/args"
+    ok "$desc: $n bounded request(s) against $RELEASES_LATEST_URL"
+}
+
+# Stale, then stale, then the expected tag. No boot until the third observation,
+# and the final binary-version check still runs (the OK line is that check).
+run_publication 0.2.130 0.2.131 success 60 1 1 "" \
+    "tag 0.2.120" "tag 0.2.120" "tag 0.2.131"
+if [ "$(pub_rc)" -eq 0 ] && [ "$(pub_boots)" -eq 1 ] && [ "$(pub_boot_at)" -eq 3 ] \
+    && [[ "$(pub_out)" == *"OK: v0.2.130 -> v0.2.131"* ]]; then
+    ok "cmd_selfupdate boots only after the expected tag is observed, then verifies the installed version"
+else
+    bad "propagation sequence did not wait for the expected tag before booting, or skipped the final version check (rc=$(pub_rc) boots=$(pub_boots) boot-at=$(pub_boot_at) out=$(pub_out) err=$(pub_err))"
+fi
+probes_text=$(cat "$PUBDIR/probes")
+if [ "$probes_text" = $'tag 0.2.120\ntag 0.2.120\ntag 0.2.131' ]; then
+    ok "the readiness loop observed old, old, then the expected tag"
+else
+    bad "readiness observations were '$probes_text', wanted old, old, expected"
+fi
+
+# Immediate expected tag: a long poll interval must not be slept.
+run_publication 0.2.130 0.2.131 success 60 30 1 "" "tag 0.2.131"
+elapsed=$(cat "$PUBDIR/elapsed")
+if [ "$(pub_rc)" -eq 0 ] && [ "$(pub_probes)" -eq 1 ] && [ "$(pub_boots)" -eq 1 ] \
+    && [ "$elapsed" -lt 8 ]; then
+    ok "an immediate expected tag does not sleep the poll interval (elapsed ${elapsed}s, 1 request)"
+else
+    bad "immediate expected tag slept or retried (rc=$(pub_rc) probes=$(pub_probes) boots=$(pub_boots) elapsed=${elapsed}s)"
+fi
+assert_probe_bounds "immediate observation" 60 1 1
+
+# Persistently stale / missing / malformed / unreachable. Small budget, no boot,
+# not success, exit 75, diagnostics name expected and last observed.
+exhaust_case() {
+    local desc="$1" preset="$2"
+    shift 2
+    run_publication 0.2.130 0.2.131 success 3 1 2 "$preset" "$@"
+    local rc boots elapsed n
+    rc=$(pub_rc)
+    boots=$(pub_boots)
+    boots=${boots:-0}
+    elapsed=$(cat "$PUBDIR/elapsed")
+    n=$(pub_probes)
+    n=${n:-0}
+    if [ "$rc" -ne 75 ] || [ "$boots" -ne 0 ] || [[ "$(pub_out)" == *"OK: v"* ]]; then
+        bad "$desc: rc=$rc boots=$boots (wanted 75 and no boot, and not a successful self-update). err=$(pub_err)"
+        return
+    fi
+    if [ "$elapsed" -lt 2 ] || [ "$elapsed" -gt 9 ]; then
+        bad "$desc: elapsed ${elapsed}s is outside the 3s test budget"
+        return
+    fi
+    if [[ "$(pub_err)" != *"UNVERIFIED (ENVIRONMENTAL)"* || "$(pub_err)" != *"publication not ready"* \
+        || "$(pub_err)" != *"Expected releases/latest to be '0.2.131'"* \
+        || "$(pub_err)" != *"last observed"* ]]; then
+        bad "$desc: missing expected/last-observed unverified diagnostic: $(pub_err)"
+        return
+    fi
+    assert_probe_bounds "$desc" 3 2 8
+}
+
+exhaust_case "persistently stale tag" "" "tag 0.2.120"
+if [[ "$(pub_err)" != *"last observed '0.2.120'"* || "$(pub_err)" != *"not a parser fault"* ]]; then
+    bad "a stale tag was not reported as propagation (err=$(pub_err))"
+else
+    ok "a stale tag is a propagation observation, not a parser fault"
+fi
+
+exhaust_case "missing redirect" "" missing
+if [[ "$(pub_err)" != *"not a proven network outage"* || "$(pub_err)" == *"parser fault"* ]]; then
+    bad "a missing redirect was described as a network outage or a parser fault: $(pub_err)"
+else
+    ok "a missing redirect is unverified and is not called a network outage"
+fi
+
+exhaust_case "malformed redirect" "" malformed
+if [[ "$(pub_err)" != *"not a proven network outage"* ]]; then
+    bad "a malformed redirect was not distinguished from a network outage: $(pub_err)"
+else
+    ok "a malformed redirect is not a proven network outage"
+fi
+
+exhaust_case "non-version tag" "" "badtag not-a-version"
+if [[ "$(pub_err)" != *"last observed 'not-a-version'"* || "$(pub_err)" != *"not a proven network outage"* ]]; then
+    bad "a non-version tag was not shown as the last observation, or was called an outage: $(pub_err)"
+else
+    ok "a non-version tag is an unusable observation, not an outage"
+fi
+
+exhaust_case "unreachable latest-release endpoint" "" fail
+if [[ "$(pub_err)" != *"last observed '<request failed>'"* || "$(pub_err)" == *"parser fault"* \
+    || "$(pub_err)" == *"proven network outage"* ]]; then
+    bad "an unreachable endpoint was mis-described: $(pub_err)"
+else
+    ok "an unreachable endpoint stays unverified without claiming a parser fault or a proven outage"
+fi
+
+# A newer tag must not become the target, and must not pass.
+run_publication 0.2.130 0.2.131 success 3 1 1 "0.2.999" "tag 0.2.999"
+if [ "$(pub_rc)" -eq 75 ] && [ "$(pub_boots)" -eq 0 ] \
+    && [[ "$(pub_err)" == *"Expected releases/latest to be '0.2.131'"* ]] \
+    && [[ "$(pub_err)" == *"last observed '0.2.999'"* ]] \
+    && [[ "$(pub_err)" == *"was not replaced"* ]] \
+    && [ "$(cat "$PUBDIR/target")" = "0.2.131" ]; then
+    ok "a newer unexpected release does not replace the expected target or pass"
+else
+    bad "newer tag changed the target or passed (rc=$(pub_rc) target=$(cat "$PUBDIR/target") err=$(pub_err))"
+fi
+
+# Caller-supplied CANARY_EXPECTED_LATEST equal to the argument is still not
+# evidence the redirect serves it.
+run_publication 0.2.130 0.2.131 success 3 1 1 "0.2.131" "tag 0.2.120"
+if [ "$(pub_rc)" -eq 75 ] && [ "$(pub_boots)" -eq 0 ] && [ "$(pub_probes)" -ge 2 ]; then
+    ok "a caller-supplied expected version cannot bypass readiness"
+else
+    bad "CANARY_EXPECTED_LATEST bypassed readiness (rc=$(pub_rc) boots=$(pub_boots) probes=$(pub_probes))"
+fi
+
+# Newer first, then the real expected tag. Success proves the target stayed
+# the argument (the node logs that version and the final binary matches it).
+run_publication 0.2.130 0.2.131 success 60 1 1 "0.2.999" \
+    "tag 0.2.999" "tag 0.2.131"
+if [ "$(pub_rc)" -eq 0 ] && [ "$(pub_boot_at)" -eq 2 ] \
+    && [ "$(cat "$PUBDIR/target")" = "0.2.131" ] \
+    && [[ "$(pub_out)" == *"OK: v0.2.130 -> v0.2.131"* ]]; then
+    ok "seeing a newer tag first does not retarget the self-update"
+else
+    bad "a transient newer tag retargeted Gate B (rc=$(pub_rc) boot-at=$(pub_boot_at) target=$(cat "$PUBDIR/target") out=$(pub_out) err=$(pub_err))"
+fi
+
+# Binaries that predate the observed-latest marker still wait, and still have
+# to land on the expected version. 0.2.124 is the last version before
+# MARKER_LATEST_SEEN_SINCE.
+run_publication 0.2.124 0.2.125 success-old 3 1 1 "" "tag 0.2.123"
+if [ "$(pub_rc)" -eq 75 ] && [ "$(pub_boots)" -eq 0 ] \
+    && [[ "$(pub_err)" == *"Expected releases/latest to be '0.2.125'"* ]] \
+    && [[ "$(pub_err)" == *"last observed '0.2.123'"* ]]; then
+    ok "a pre-marker previous binary still requires publication readiness"
+else
+    bad "pre-marker binary skipped readiness (rc=$(pub_rc) boots=$(pub_boots) err=$(pub_err))"
+fi
+run_publication 0.2.124 0.2.125 success-old 60 30 1 "" "tag 0.2.125"
+if [ "$(pub_rc)" -eq 0 ] && [[ "$(pub_out)" == *"OK: v0.2.124 -> v0.2.125"* ]]; then
+    ok "a pre-marker previous binary still has to land on the expected version"
+else
+    bad "pre-marker success path failed (rc=$(pub_rc) out=$(pub_out) err=$(pub_err))"
+fi
+run_publication 0.2.124 0.2.125 wrong-final 60 30 1 "" "tag 0.2.125"
+if [ "$(pub_rc)" -ne 0 ] && [ "$(pub_boots)" -eq 1 ] \
+    && [[ "$(pub_err)" == *"did NOT land"* ]]; then
+    ok "a pre-marker binary that does not end on the expected version still fails the install check"
+else
+    bad "pre-marker install check did not run (rc=$(pub_rc) boots=$(pub_boots) err=$(pub_err))"
+fi
+
+# After readiness has succeeded: wrong node version and parse failure are
+# immediate; a genuine indeterminate node result is still retried.
+run_publication 0.2.130 0.2.131 wrong-latest 60 30 2 "" "tag 0.2.131"
+if [ "$(pub_rc)" -eq 1 ] && [ "$(pub_boots)" -eq 1 ] \
+    && [[ "$(pub_err)" == *"WRONG release"* ]]; then
+    ok "after readiness, a wrong node version is an immediate failure"
+else
+    bad "wrong node version was retried or mis-diagnosed (rc=$(pub_rc) boots=$(pub_boots) err=$(pub_err))"
+fi
+run_publication 0.2.130 0.2.131 parse-fail 60 30 2 "" "tag 0.2.131"
+if [ "$(pub_rc)" -eq 1 ] && [ "$(pub_boots)" -eq 1 ] \
+    && [[ "$(pub_err)" == *"could not parse"* ]]; then
+    ok "after readiness, a parse failure is not retried"
+else
+    bad "parse failure was retried or mis-diagnosed (rc=$(pub_rc) boots=$(pub_boots) err=$(pub_err))"
+fi
+run_publication 0.2.130 0.2.131 fetch-fail 60 30 2 "" "tag 0.2.131"
+if [ "$(pub_boots)" -eq 2 ] && [ "$(pub_rc)" -ne 0 ]; then
+    ok "after readiness, an indeterminate node fetch failure is still retried"
+else
+    bad "indeterminate node result lost its retry (rc=$(pub_rc) boots=$(pub_boots) err=$(pub_err))"
+fi
+run_publication 0.2.130 0.2.131 wrong-final 60 30 2 "" "tag 0.2.131"
+if [ "$(pub_rc)" -eq 1 ] && [ "$(pub_boots)" -eq 1 ] \
+    && [[ "$(pub_err)" == *"did NOT land"* ]] \
+    && [ "$(grep -c '^version$' "$PUBDIR/events")" -ge 2 ]; then
+    ok "after readiness, the final installed-version assertion still runs and still fails closed"
+else
+    bad "final version assertion did not fail closed (rc=$(pub_rc) boots=$(pub_boots) events=$(cat "$PUBDIR/events") err=$(pub_err))"
+fi
 
 echo
 if [[ "$FAILURES" -eq 0 ]]; then

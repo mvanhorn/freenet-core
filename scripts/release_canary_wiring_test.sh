@@ -2724,6 +2724,195 @@ else
         "this one -- the #5221 failure mode. Nothing else covers it."
 fi
 
+# --- 8. Gate B and Gateway Update share one concurrency group (#5715) -------
+# The release event starts Gateway Update while Gate B is about to bootstrap
+# a node through the gateways that rollout restarts. The lock has to be the
+# same literal on both surfaces, with cancel-in-progress explicitly false.
+#
+# GitHub concurrency is mutual exclusion, not a queue. A tag/version/run/
+# workflow suffix splits the lock so the two operations can overlap. Putting
+# the group on the whole cross-compile workflow (or on attach-to-release)
+# makes the parent hold a lock its own later job needs. Comments are stripped
+# before the group is read, so a note that quotes the literal cannot satisfy
+# the pin; the test does not embed the group name.
+GW="$SCRIPT_DIR/../.github/workflows/gateway-update.yml"
+RELEASING_MD="$SCRIPT_DIR/../docs/RELEASING.md"
+
+strip_yaml_comments() {
+    awk '$0 !~ /^[[:space:]]*#/' "$1"
+}
+
+workflow_concurrency_block() {
+    awk '
+        /^concurrency:[[:space:]]*$/ { in_c = 1; print; next }
+        in_c && /^[^#[:space:]]/ { exit }
+        in_c && /^[[:space:]]*#/ { next }
+        in_c { print }
+    ' "$1"
+}
+
+job_concurrency_block() {
+    awk '
+        /^    concurrency:[[:space:]]*$/ { in_c = 1; print; next }
+        in_c && /^    [A-Za-z0-9_-]+:/ { exit }
+        in_c { print }
+    '
+}
+
+yaml_key() {
+    printf '%s\n' "$1" | sed -n "s/^[[:space:]]*$2:[[:space:]]*//p" | head -1 | sed 's/[[:space:]]*$//'
+}
+
+if [[ ! -f "$GW" ]]; then
+    fail "gateway-update.yml is missing" \
+        "Gate B cannot be serialised against a workflow that is not there."
+else
+    gate_b_job="$(yaml_job_block auto-update-selfupdate-canary)"
+    gate_b_conc="$(printf '%s\n' "$gate_b_job" | job_concurrency_block)"
+    attach_conc="$(yaml_job_block attach-to-release | job_concurrency_block)"
+    top_conc="$(workflow_concurrency_block "$WF")"
+    gw_conc="$(workflow_concurrency_block "$GW")"
+    gw_stripped="$(strip_yaml_comments "$GW")"
+    wf_stripped="$(strip_yaml_comments "$WF")"
+
+    gate_b_group="$(yaml_key "$gate_b_conc" group)"
+    gate_b_cancel="$(yaml_key "$gate_b_conc" cancel-in-progress)"
+    gw_group="$(yaml_key "$gw_conc" group)"
+    gw_cancel="$(yaml_key "$gw_conc" cancel-in-progress)"
+    top_group="$(yaml_key "$top_conc" group)"
+    # shellcheck disable=SC2016  # the ${{ }} is GitHub expression text, compared literally
+    expected_top_group='cross-compile-${{ github.ref }}'
+
+    job_level_count="$(printf '%s\n' "$wf_stripped" | grep -cE '^    concurrency:[[:space:]]*$' || true)"
+    gw_job_level_count="$(printf '%s\n' "$gw_stripped" | grep -cE '^    concurrency:[[:space:]]*$' || true)"
+
+    if [[ -z "$gate_b_conc" ]]; then
+        fail "Gate B's job has no concurrency block" \
+            "The shared lock has to be on auto-update-selfupdate-canary itself." \
+            "On the workflow, or only in a comment, Gateway Update can restart" \
+            "nova while this job is booting a node through it."
+    elif [[ "$job_level_count" -ne 1 ]]; then
+        fail "cross-compile.yml has $job_level_count job-level concurrency blocks, wanted 1" \
+            "Only the Gate B job takes the shared group. A second block, or none," \
+            "either splits the lock or moves it onto a parent that holds it while" \
+            "its own child waits."
+    elif [[ -n "$attach_conc" ]]; then
+        fail "attach-to-release has its own concurrency block" \
+            "That job publishes the release and must not hold the gateway lock." \
+            "$attach_conc"
+    elif [[ "$top_group" != "$expected_top_group" ]]; then
+        fail "cross-compile.yml workflow concurrency group changed" \
+            "It is '$top_group'." \
+            "The publishing workflow must keep its own group. Replacing it with" \
+            "the gateway lock makes the parent hold a lock Gate B then needs."
+    elif [[ -z "$gw_conc" ]]; then
+        fail "gateway-update.yml has no workflow-level concurrency block" \
+            "Planning, restart, and convergence verification all have to sit in" \
+            "the same group as Gate B. A job-level lock would leave the others free."
+    elif [[ "$gw_job_level_count" -ne 0 ]]; then
+        fail "gateway-update.yml has a job-level concurrency block" \
+            "That would narrow or split the workflow-level group that covers" \
+            "plan, restart, and the existing convergence check."
+    elif [[ -z "$gate_b_group" || "$gate_b_group" != "$gw_group" ]]; then
+        fail "Gate B and Gateway Update do not use the same concurrency group" \
+            "Gate B: '${gate_b_group:-<missing>}'" \
+            "Gateway Update: '${gw_group:-<missing>}'" \
+            "Different literals, including a workflow-specific suffix, let a" \
+            "rollout and the canary run at the same time."
+    elif [[ "$gate_b_cancel" != "false" || "$gw_cancel" != "false" ]]; then
+        fail "cancel-in-progress is not explicitly false on both surfaces" \
+            "Gate B: '${gate_b_cancel:-<missing>}'" \
+            "Gateway Update: '${gw_cancel:-<missing>}'" \
+            "true cancels a running canary or a running rollout. Omitting the" \
+            "key is not the explicit setting this gate is pinned to."
+    elif [[ ! "$gate_b_group" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
+        fail "the shared concurrency group is not a single literal" \
+            "group: $gate_b_group" \
+            "An expression, a tag, a version, a run id, or a workflow suffix" \
+            "puts each release in its own lock."
+    elif [[ "$gate_b_group" =~ \$\{|tag_name|inputs\.version|github\.(ref|sha|run_id|run_number|workflow|event)|runner\. ]]; then
+        fail "the shared concurrency group varies per tag, version, run, or workflow" \
+            "group: $gate_b_group" \
+            "That splits the lock. Manual rollouts and every version share the" \
+            "same gateways, so they have to share this group."
+    else
+        pass "Gate B and Gateway Update share one literal group with cancel-in-progress false ($gate_b_group)"
+    fi
+
+    # Triggers stay. Serialization must not swallow the release event or the
+    # manual rollout path, and must not grow a cross-workflow needs.
+    gw_header="$(awk '/^jobs:/ { exit } { print }' "$GW")"
+    if [[ "$gw_header" == *'types: [published]'* && "$gw_header" == *'workflow_dispatch:'* ]]; then
+        pass "gateway-update.yml still triggers on release.published and workflow_dispatch"
+    else
+        fail "gateway-update.yml lost a release or manual trigger" \
+            "The shared group covers both. Dropping one leaves that path" \
+            "unsynchronised with Gate B."
+    fi
+    if [[ "$gw_stripped" == *'workflow_run:'* || "$gw_stripped" == *'auto-update-selfupdate-canary'* ]]; then
+        fail "gateway-update.yml gained a dependency on the canary" \
+            "Concurrency is mutual exclusion. A needs or workflow_run on Gate B" \
+            "would hold gateway recovery until the canary succeeded."
+    else
+        pass "gateway recovery is not gated on the canary job"
+    fi
+    if [[ "$gate_b_job" == *'gateway-update'* ]]; then
+        fail "the Gate B job now references gateway-update outside a comment" \
+            "Do not add a cross-workflow needs. The concurrency group is the lock."
+    else
+        pass "Gate B does not take a needs dependency on gateway-update"
+    fi
+
+    ready_default="$(sed -n 's/.*CANARY_PUBLICATION_READY_SECS:-\([0-9][0-9]*\).*/\1/p' \
+        "$SCRIPT_DIR/auto-update-canary.sh" | head -1)"
+    notify_raw="$(yaml_job_block notify-auto-update-canary-failure)"
+    quiet_msg="$(printf '%s\n' "$notify_raw" | awk '
+        /id: notify-environmental/ { p = 1 }
+        p && /id: notify-fault/ { exit }
+        p { print }
+    ')"
+    loud_msg="$(printf '%s\n' "$notify_raw" | awk '
+        /id: notify-fault/ { p = 1 }
+        p { print }
+    ')"
+    if [[ -z "$ready_default" ]]; then
+        fail "could not read CANARY_PUBLICATION_READY_SECS from the canary" \
+            "The notification and the runbook would then be checked against nothing."
+    elif [[ "$quiet_msg" != *"$ready_default"* || "$quiet_msg" != *"publication not ready"* \
+        || "$quiet_msg" != *"not a proven network outage"* ]]; then
+        fail "the quiet notification does not describe publication-not-ready" \
+            "It must name publication not ready, the readiness budget ($ready_default" \
+            "seconds, read from the canary), and that a malformed observation is" \
+            "not a proven network outage. Exit 75 still fails the job." \
+            "Quiet step:" \
+            "$quiet_msg"
+    else
+        pass "the quiet notification names publication-not-ready and the ${ready_default}s budget"
+    fi
+    if [[ "$loud_msg" == *"A cancelled self-update canary is not a verified release"* ]]; then
+        pass "a cancelled canary is described as not verified"
+    else
+        fail "the loud notification no longer says a cancelled canary is not verified" \
+            "Cancellation is mutual exclusion, not a pass. The existing cancelled" \
+            "result clause must keep landing on this message."
+    fi
+    if [[ -n "$ready_default" && -f "$RELEASING_MD" \
+        && "$RELEASING_MD" != "" \
+        && "$(cat "$RELEASING_MD")" == *"$gate_b_group"* \
+        && "$(cat "$RELEASING_MD")" == *"$ready_default"* \
+        && "$(cat "$RELEASING_MD")" == *"Either operation may run first"* \
+        && "$(cat "$RELEASING_MD")" == *"not a queue"* \
+        && "$(cat "$RELEASING_MD")" == *"not a verified release"* ]]; then
+        pass "RELEASING.md documents the shared group, the wait, and that a cancelled canary is not verified"
+    else
+        fail "RELEASING.md does not document the publication wait and the shared lock" \
+            "It has to name the group taken from the workflows ('${gate_b_group:-<missing>}')," \
+            "the readiness budget ($ready_default), that either operation may run first," \
+            "that the group is not a queue, and that a cancelled canary is not verified." \
+            "Live CDN timing and scheduler order are not claimed as tested."
+    fi
+fi
+
 echo
 if [[ "$FAILURES" -eq 0 ]]; then
     echo "All release canary wiring assertions passed."

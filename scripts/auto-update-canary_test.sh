@@ -626,6 +626,88 @@ else
     echo "ok   - cmd_selfupdate arms the equality check from its expected-version argument"
 fi
 
+# The readiness wait is a separate observation from the equality target. It
+# must run on the caller's expected version, and it must not live only in a
+# test. Scoped to the function body so a comment elsewhere cannot satisfy it.
+# shellcheck disable=SC2016  # literal source text; must not expand
+if [[ "$selfupdate_body" == *'await_publication_ready "$expected_version"'* ]]; then
+    echo "ok   - cmd_selfupdate waits for publication of its expected-version argument"
+else
+    echo "FAIL - cmd_selfupdate does not wait for publication readiness." >&2
+    echo "       Without that wait a stale /releases/latest tag is scored as a broken" >&2
+    echo "       comparator (#5715). The expected version is the argument, not a" >&2
+    echo "       re-resolved tag and not CANARY_EXPECTED_LATEST." >&2
+    FAILURES=$((FAILURES + 1))
+fi
+
+# Gate A's resolver keeps its historical budget when called with no arguments,
+# and the same function accepts a clamped timeout with zero retries for the
+# readiness loop. Sharing the URL and the tag parse is the point; nesting the
+# unbounded retry sequence inside the five-minute deadline is not.
+resolve_args_case() {
+    local desc="$1" want_rc="$2" want_tag="$3" mode="$4"
+    shift 4
+    local argsfile got rc args
+    argsfile="$(mktemp "$TMPROOT/resolve-args.XXXXXX")"
+    # `ok` calls with NO arguments, so the historical defaults are what is
+    # measured. Passing 30 and 2 explicitly would stay green after those
+    # defaults were deleted. `ok-override` is the readiness loop's shape.
+    if [ "$mode" = ok ]; then
+        got="$(
+            curl() {
+                printf '%s\n' "$*" > "$argsfile"
+                printf '%s' 'https://github.com/freenet/freenet-core/releases/tag/v0.2.136'
+            }
+            resolve_expected_latest
+        )" && rc=0 || rc=$?
+    else
+        got="$(
+            curl() {
+                printf '%s\n' "$*" > "$argsfile"
+                if [ "$mode" = fail ]; then
+                    return 28
+                fi
+                if [ "$mode" = bad ]; then
+                    printf '%s' 'https://example.invalid/nope'
+                    return 0
+                fi
+                printf '%s' 'https://github.com/freenet/freenet-core/releases/tag/v0.2.136'
+            }
+            resolve_expected_latest "$@"
+        )" && rc=0 || rc=$?
+    fi
+    args="$(cat "$argsfile")"
+    rm -f "$argsfile"
+    if [ "$rc" -ne "$want_rc" ] || [ "$got" != "$want_tag" ]; then
+        echo "FAIL - resolve_expected_latest: $desc (rc=$rc tag='$got', wanted rc=$want_rc tag='$want_tag')" >&2
+        FAILURES=$((FAILURES + 1))
+        return
+    fi
+    if [ "$mode" = ok ] || [ "$mode" = "ok-override" ]; then
+        local want_time="$1" want_retry="$2"
+        # shellcheck disable=SC2086
+        if [[ " $args " != *" --max-time $want_time "* || " $args " != *" --retry $want_retry "* ]]; then
+            echo "FAIL - resolve_expected_latest: $desc args were '$args'" >&2
+            echo "       wanted --max-time $want_time and --retry $want_retry." >&2
+            echo "       Gate A must keep 30s and 2 retries. Readiness passes a clamped" >&2
+            echo "       ceiling and 0 retries so the inner sequence cannot outlive the" >&2
+            echo "       five-minute deadline." >&2
+            FAILURES=$((FAILURES + 1))
+            return
+        fi
+        if [[ "$args" != *"$RELEASES_LATEST_URL"* || "$args" == *api.github.com* ]]; then
+            echo "FAIL - resolve_expected_latest: $desc hit '$args', not $RELEASES_LATEST_URL" >&2
+            FAILURES=$((FAILURES + 1))
+            return
+        fi
+    fi
+    echo "ok   - resolve_expected_latest: $desc"
+}
+resolve_args_case "Gate A defaults (30s, 2 retries) and v-stripping" 0 "0.2.136" ok 30 2
+resolve_args_case "explicit ceiling and zero retries" 0 "0.2.136" ok-override 4 0
+resolve_args_case "unusable redirect is not a tag and not success" 2 "" bad
+resolve_args_case "a failed request is not a tag and not success" 1 "" fail
+
 # --- environmental classification: the alarm must not blame the fleet -------
 # `node_could_not_reach_github` is what stops the post-publish Matrix alarm
 # saying "a node on the previous release may not be able to auto-update to this
@@ -855,6 +937,12 @@ gate_b_case() {
         CANARY_RETRY_SLEEP=0
         curl() { :; }
         tar()  { :; }
+        # These cases are the node loop, after publication is already visible.
+        # A no-op curl must not become a live readiness poll (or a five-minute
+        # hang). CANARY_EXPECTED_LATEST is the assertion target, not evidence
+        # the redirect has caught up, so this stub is an explicit observation
+        # of "already the expected tag" -- not a bypass the production path has.
+        await_publication_ready() { return 0; }
         run_node_until_check() { run_node_until_check_stub "$@"; }
         if [[ "$reachable" == yes ]]; then
             runner_can_reach_github() { return 0; }

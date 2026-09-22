@@ -447,6 +447,11 @@ gh workflow run release.yml
                                             └─→ nova runs riverctl locally
 ```
 
+Gate B (`auto-update-selfupdate-canary`) starts once `attach-to-release` has
+published, which is the same moment `gateway-update.yml` is triggered. Those
+two share the `freenet-release-gateways` concurrency group above. Either may
+run first. A cancelled canary is not a verified release.
+
 ## How to monitor
 
 - **All in one place**:
@@ -738,6 +743,31 @@ makes. It cannot run earlier: the detection path is hardwired to GitHub's
 loud (red job plus a River dev-room message) but does not block, since the
 release is already public by then.
 
+Before that previous binary is booted, Gate B polls the same public
+`/releases/latest` redirect (not the REST API) until the tag is **this**
+release, for up to 300 seconds (`CANARY_PUBLICATION_READY_SECS`). A stale
+older tag in that window is propagation lag, not a broken comparator:
+v0.2.136's canary failed this way, and the same binary saw the new release on
+its own a little later. The expected version is the one the workflow just
+published. An observed tag, including a newer one, does not replace it, and
+exporting `CANARY_EXPECTED_LATEST` does not skip the wait. If the wait
+expires, Gate B exits 75 (`UNVERIFIED (ENVIRONMENTAL): publication not ready`)
+**without booting the node**. A malformed or missing redirect is not a proven
+network outage; the log prints the expected tag and the last observation. The
+wait does not prove every CDN edge agrees with the runner. After it succeeds,
+the node's own equality check stays strict.
+
+Gate B and `gateway-update.yml` share one repository-wide concurrency group,
+`freenet-release-gateways`, with `cancel-in-progress: false`. The group sits
+on the `auto-update-selfupdate-canary` job, not on `attach-to-release` and not
+on the whole cross-compile workflow. On the gateway side it is workflow-level,
+so planning, the restart, and the convergence check are all inside it,
+including manual rollouts and every version: they restart the same gateways
+Gate B bootstraps through. Either operation may run first. This is mutual
+exclusion, not a queue: GitHub does not promise FIFO, and a newer pending run
+can replace an older pending one. A cancelled canary is not a verified
+release; re-run it. Gateway recovery is not gated on a green canary.
+
 Both assertions are deliberately **two-sided**: the `Startup update check
 against GitHub` line must be PRESENT *and* there must be no
 `Startup update check: failed to parse` warning (the marker stops at
@@ -857,31 +887,32 @@ reports "the startup update check never ran" for no clear reason, check for a
 stray `freenet network` process first; a leaked node holds its ports and burns
 CPU, which is how this surfaced before (see the lifecycle test's case 2 notes).
 
-**Gate B's own code is never executed by any test.** The two gaps above are
-about what the gates cannot observe when they run. This one is about the tests
-*behind* the gates, and it is worth stating separately because it is easy to
-mistake a large green suite for coverage it does not have.
+**Offline tests do not prove live CDN propagation or scheduler order.** The
+lifecycle test drives the real `cmd_selfupdate` against a fake node and a
+scripted `/releases/latest` redirect: stale-then-expected, exhaustion,
+a newer tag that must not retarget the run, and the final version check.
+That is not a live GitHub. It does not show how long a real CDN edge takes
+to converge, and it does not show which of Gate B or Gateway Update GitHub's
+scheduler runs first. A green suite is not those two things.
 
-`scripts/auto-update-canary_test.sh` runs the canary's pure helpers against
-fixtures and source-scrapes the rest. `cmd_selfupdate` — the whole of Gate B —
-is never invoked, and neither is `resolve_expected_latest`. So nothing at any
-level runs the previous release's tarball download, the extraction check, the
-exit-42 assertion, `freenet update --quiet`, or the `awk '{print $3}'` field
-split that reads the updated binary's version. Those run for the first time
-during a real release, against a real GitHub.
+The previous release's real tarball download still runs for the first time
+during a release. The lifecycle test stubs `curl`/`tar` for that download so
+the suite stays offline. What it does execute is the readiness wait, the
+decision to boot, the exit-42 path against the fake, `freenet update`, and
+the version field check.
 
 What the suite does pin around that code is real, and the distinction matters
 when reading a failure: the version gate that decides whether Gate B's equality
 check arms is tested behaviourally (`prev_emits_latest_seen`), and the call
 site that consumes it is pinned including its `if ` prefix, so neither a
 negation nor a reworded call can disarm the gate silently. That is the decision
-logic. The I/O sequence it guards has no test.
+logic. The real release-tarball download is still untested; the readiness wait
+and the final version check are not.
 
 Practical consequence: a Gate B failure is more likely to be the canary's own
 plumbing than the fleet's updater, and it is non-blocking either way. Read the
-job log before concluding anything about auto-update. Closing this needs a
-runtime test with a stubbed release archive; it is a known gap, deliberately
-deferred, not an oversight.
+job log before concluding anything about auto-update. A green offline suite
+did not watch a live CDN, and it did not watch GitHub's scheduler.
 
 Net: the installer half of a shipping binary has no blocking gate, and its
 comparison logic is gated in one direction only. Treat a green Gate A as "this
@@ -980,15 +1011,17 @@ curl -sS -o /dev/null -w '%{http_code}\n' -A 'freenet-release-driver' \
 ### If Gate B fails
 
 **A red Gate B is not by itself a fleet problem, and the Matrix message is not
-enough to tell.** Five distinct outcomes end in a red job; only one of them means
+enough to tell.** Six distinct outcomes end in a red job; only one of them means
 a node on the previous release genuinely cannot reach this one. **Read the
-`::error::` line in the job log before doing anything** — it names which.
+`::error::` line in the job log before doing anything** — it names which. A
+cancelled job is none of these: it was not verified. Re-run it.
 
 The wording below is generated from the code, so match on the quoted phrases
 rather than on the shape of the alarm.
 
 | What the log says | Exit | Matrix | What it means | Response |
 |---|---|---|---|---|
+| `UNVERIFIED (ENVIRONMENTAL): publication not ready … Expected releases/latest to be '…'; last observed '…'` | 75 | ⚠️ quiet | The public latest-release redirect did not serve this release within 300 seconds. The previous binary was not booted. Not a broken comparator. A malformed or missing observation is not a proven network outage; the line names what was last seen. | Re-run. If it persists, this release never became GitHub's latest — investigate before calling the fleet stranded. |
 | `UNVERIFIED (ENVIRONMENTAL): … could not reach GitHub … and this runner cannot reach it either` | 75 | ⚠️ quiet | The network was down for both the node and the runner. Nothing learned. | Re-run the job. |
 | `UNVERIFIED (ENVIRONMENTAL): every attempt hit a port collision on this host` | 75 | ⚠️ quiet | Something else on the runner held the ports; the node never started. | Re-run the job. |
 | `UNVERIFIED: … reported it could not reach GitHub … but THIS RUNNER reached the same endpoint immediately afterwards` | 1 | 🚨 loud | The published binary consistently could not do what the runner just did. Most likely its persisted poll-budget cooldown (#5102), possibly a published fetch-side regression. **Not a stranded fleet.** | Read the node output. Re-run; if it recurs across releases it is not the runner. |
@@ -1011,15 +1044,21 @@ on an otherwise healthy runner — produces **exit 1 and the loud 🚨**, and th
 text sent the reader straight past it into "a real detection failure" and on to
 cutting a fix release for a poll-budget cooldown.
 
-**1. Environmental (exit 75, quiet ⚠️).** Two causes, both above. The previous
-release's binary retries its startup fetch zero times, so a single bad moment on
-the network is enough to produce the first. Gate B retries (`CANARY_ATTEMPTS`, 2
-by default) and only reports this if every attempt lands the same way AND this
-runner also cannot reach the endpoint. The job stays red: unverified is not
+**1. Environmental (exit 75, quiet ⚠️).** Three causes. The two node-side ones
+are above: the previous release's binary retries its startup fetch zero times,
+so a single bad moment on the network is enough to produce the first, and a
+port collision never starts the node. Gate B retries (`CANARY_ATTEMPTS`, 2 by
+default) and only reports the GitHub cause if every attempt lands the same way
+AND this runner also cannot reach the endpoint. The third cause is earlier:
+publication not ready. Gate B polls `/releases/latest` for up to 300 seconds
+before the first boot and, if the expected tag never appears, exits 75 without
+starting the node. That is propagation lag (or a release that never became
+latest), not a comparator bug. A malformed observation in that wait is not a
+proven network outage. The job stays red either way: unverified is not
 verified. Adding a retry to the node's own fetch
-(`crates/core/src/bin/commands/auto_update.rs`) would shrink the class, but only
-for releases published after that lands, since Gate B always drives an
-already-published binary.
+(`crates/core/src/bin/commands/auto_update.rs`) would shrink the network class,
+but only for releases published after that lands, since Gate B always drives
+an already-published binary.
 
 If either of these appears on **consecutive** releases, stop treating it as
 noise: nothing has been verified since the last green run, and for the GitHub
@@ -1091,7 +1130,9 @@ verification skill if you have it):
    is green — a node on the previous release reached this one on its own. If
    it is red, read the job log before concluding anything: a red job can mean
    the fleet is stranded OR that the run was environmental (exit 75, quiet ⚠️
-   Matrix message, re-run it). See "If Gate B fails" above.
+   Matrix message, re-run it) OR that the job was cancelled by the shared
+   gateway concurrency group. A cancellation is not a verified release. See
+   "If Gate B fails" above.
 
 [PR #4135]: https://github.com/freenet/freenet-core/pull/4135
 [river#241]: https://github.com/freenet/river/issues/241

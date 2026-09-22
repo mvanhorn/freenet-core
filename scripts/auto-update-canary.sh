@@ -52,7 +52,10 @@
 #                 `freenet update`? End-to-end proof of the real fleet
 #                 transition. It cannot run before publication: the node's
 #                 detection path is hardwired to GitHub's `/releases/latest`,
-#                 and a draft release does not appear there.
+#                 and a draft release does not appear there. Before the first
+#                 node boot it waits until that same redirect serves the
+#                 release under test, so a stale previous tag is not scored
+#                 as a broken updater (#5715).
 #
 # Run either locally. Both keep their FILES to their own temp directory
 # (isolated HOME, TMPDIR, webapp cache, and config/data/log dirs), so nothing
@@ -269,8 +272,12 @@ EXIT_CODE_ALREADY_RUNNING=43
 # reusing it here would make "the canary exited 43" mean either "another process
 # held the port" or "the node started fine and GitHub was unreachable" --
 # indistinguishable at the one moment someone is reading it under time pressure,
-# on a release. The port collision is one of the two things that produce a 75;
-# it is not what 75 means.
+# on a release. The port collision is one of the things that produce a 75; it
+# is not what 75 means. The others are a corroborated GitHub outage (the node
+# and this runner both failed the fetch) and publication not ready:
+# `/releases/latest` did not serve the expected tag within the readiness
+# budget. A malformed or missing redirect is that last case too, and it is
+# not a proven network outage.
 #
 # The job still goes RED on a 75. Unverified is not verified, and reporting green
 # on a run that proved nothing is the vacuous pass this whole file exists to
@@ -366,6 +373,23 @@ CANARY_RETRY_SLEEP="${CANARY_RETRY_SLEEP:-20}"
 # canary stops the node mid-request and reads the resulting silence as health
 # (#5236).
 CANARY_OUTCOME_WAIT_SECS="$(sanitise_positive_int "${CANARY_OUTCOME_WAIT_SECS:-20}" 20)"
+
+# How long Gate B waits, before the first node boot, for the public
+# `/releases/latest` redirect to serve the release the caller just published.
+# About five minutes. v0.2.136's canary failed because the previous binary
+# observed v0.2.135 in the window just after publication; the same binary
+# then saw v0.2.136 on its own. This is a ceiling, not a sleep: the first
+# matching observation returns immediately.
+#
+# Sanitised like the budgets above. A non-numeric override must not become an
+# unbounded poll or an arithmetic abort under `set -u`. Read again at use so
+# a test can shrink it after this file is sourced, the same way
+# `CANARY_ATTEMPTS` is overridden.
+CANARY_PUBLICATION_READY_SECS="$(sanitise_positive_int "${CANARY_PUBLICATION_READY_SECS:-300}" 300)"
+# Gap between observations that are not yet the expected tag. A valid older
+# tag is propagation lag, not a fault, so it is polled again rather than
+# failed on the first sample. The matching observation never reaches this.
+CANARY_PUBLICATION_POLL_SECS="$(sanitise_positive_int "${CANARY_PUBLICATION_POLL_SECS:-10}" 10)"
 
 log()  { printf '%s\n' "$*"; }
 fail() { printf '::error::%s\n' "$*" >&2; }
@@ -680,13 +704,21 @@ assert_detection_healthy() {
   #
   #     `CANARY_EXPECTED_LATEST` is supplied by the CALLER, not fetched here, so
   #     this function stays pure and unit-testable against log fixtures. The
-  #     caller (cmd_preflight) resolves it from the GitHub API and returns
-  #     INDETERMINATE if it cannot -- so "unset" never reaches here on the
-  #     release path, and the skip below cannot silently disarm the gate on a
-  #     real run. `auto-update-canary_test.sh` pins that cmd_preflight resolves
-  #     it, exports it, and refuses when it cannot -- without that pin this
-  #     skip branch would be exactly the vacuous escape hatch the gate exists
-  #     to remove.
+  #     caller resolves it (Gate A, from the same `/releases/latest` redirect
+  #     the node uses; Gate B, from the version it was told to expect) and the
+  #     skip below cannot silently disarm the gate on a real run.
+  #     `auto-update-canary_test.sh` pins that cmd_preflight resolves it,
+  #     exports it, and refuses when it cannot -- without that pin this skip
+  #     branch would be exactly the vacuous escape hatch the gate exists to
+  #     remove.
+  #
+  #     Gate B's publication-readiness wait is NOT this check and cannot
+  #     satisfy it. That wait observes the redirect from the RUNNER before the
+  #     node boots. This comparison is what the NODE logged. The two can still
+  #     disagree -- different caches, a redirect that moved again -- and a node
+  #     that compared against the wrong release is not healthy. The wait
+  #     mitigates the post-publish race. It does not prove every CDN edge
+  #     agrees, and a mismatch here stays a hard failure: it is not retried.
   if [ -n "${CANARY_EXPECTED_LATEST:-}" ]; then
     local seen_line seen
     seen_line="$(log_lines "$logdir" "$MARKER_LATEST_SEEN" | tail -1)"
@@ -1100,7 +1132,16 @@ run_node_until_check() {
 #
 # The tag GitHub currently publishes as "latest", normalised the way
 # `version_from_tag` normalises it (strip AT MOST one leading `v`). Echoes it
-# on stdout; returns 1 if it cannot be determined.
+# on stdout; returns non-zero if it cannot be determined.
+#
+#   1 -- the request failed (network, timeout, curl missing). Nothing was
+#        observed. This is not by itself a proven picture of why.
+#   2 -- curl succeeded but the redirect was unusable (not a
+#        `/releases/tag/<tag>` URL, or an empty tag). That is not a network
+#        outage and not a tag.
+#
+# Gate A treats both as "unresolved". The publication-readiness loop
+# distinguishes them so a malformed observation is not described as an outage.
 #
 # Deliberately the SAME source the node itself uses --
 # `github.com/{repo}/releases/latest`, read from the 302 `Location` -- and not
@@ -1196,23 +1237,41 @@ prev_emits_latest_seen() {
 }
 
 resolve_expected_latest() {
-  local url tag
-  # `--retry`: this call has no second chance anywhere else. Its failure returns
-  # 1 from cmd_preflight BEFORE the attempt loop is entered, so unlike every
-  # node-side indeterminate -- which gets CANARY_ATTEMPTS tries -- a single
-  # transient blip here blocks the release outright. The comment above justifies
-  # the no-retry stance with "not something a re-run fixes", which is true of the
-  # NODE's verdict and not of one curl. `--retry-all-errors` because the
-  # interesting failures (connection reset, DNS blip) are not HTTP statuses,
-  # which is all bare `--retry` covers.
-  url="$(curl -fsS --max-time 30 --retry 2 --retry-all-errors \
+  # Optional overrides. Called with no arguments -- Gate A's path -- this keeps
+  # the historical budget: one 30s request plus two retries. A single transient
+  # blip here used to block the release outright, because a failure returns
+  # from cmd_preflight BEFORE the attempt loop. `--retry-all-errors` because
+  # the interesting failures (connection reset, DNS blip) are not HTTP
+  # statuses, which is all bare `--retry` covers.
+  #
+  # The publication-readiness loop passes a per-request ceiling clamped to the
+  # time it has left, and ZERO retries. Nesting these two retries inside that
+  # outer deadline would make a five-minute wait a fiction: curl's retry timer
+  # is not charged against the caller's clock unless `--retry-max-time` is set,
+  # and this call does not set it. `--retry 0` is a real curl value and must
+  # survive the sanitiser below; folding 0 back to the default would put Gate
+  # A's retries under the readiness deadline.
+  local max_time="${1:-30}" retries="${2:-2}" url tag
+  case "$max_time" in
+    ''|*[!0-9]*) max_time=30 ;;
+  esac
+  max_time=$((10#$max_time))
+  if [ "$max_time" -lt 1 ]; then
+    # `curl --max-time 0` disables the timeout. Never pass it.
+    max_time=30
+  fi
+  case "$retries" in
+    ''|*[!0-9]*) retries=2 ;;
+  esac
+  retries=$((10#$retries))
+  url="$(curl -fsS --max-time "$max_time" --retry "$retries" --retry-all-errors \
     -o /dev/null -w '%{redirect_url}' \
     "$RELEASES_LATEST_URL" 2>/dev/null)" || return 1
   case "$url" in
     */releases/tag/*) tag="${url##*/releases/tag/}" ;;
-    *) return 1 ;;
+    *) return 2 ;;
   esac
-  [ -n "$tag" ] || return 1
+  [ -n "$tag" ] || return 2
   normalise_release_tag "$tag"
 }
 
@@ -1547,6 +1606,111 @@ cmd_preflight() {
   return 1
 }
 
+# await_publication_ready <expected-version>
+#
+# Poll `$RELEASES_LATEST_URL` until its normalised tag equals <expected-version>,
+# or the readiness budget runs out. Echoes nothing on success. On exhaustion
+# prints expected and last observed and returns EXIT_UNVERIFIED_ENVIRONMENTAL.
+#
+# This is an observation, not a second opinion about what the target IS.
+# <expected-version> stays the caller's value for the whole wait: a newer tag,
+# an older tag, or a preset CANARY_EXPECTED_LATEST does not replace it and
+# does not count as "already published". CANARY_EXPECTED_LATEST is the
+# assertion the node must meet later. It is not evidence the redirect has
+# caught up.
+#
+# A valid dotted tag that is not the expected one is propagation (or a
+# different release), not a parser fault, so it is polled again. A failed
+# request or an unusable redirect never establishes readiness. The per-request
+# ceiling is the time remaining, capped at 30s, with zero inner retries -- so
+# this loop cannot outlive its own deadline by borrowing Gate A's retry
+# sequence.
+#
+# Exhaustion does not boot a node. Unverified is not a broken comparator and
+# not a successful self-update.
+await_publication_ready() {
+  local expected="$1"
+  local budget poll deadline now remaining max_time tag rc
+  local observed="<none>" last_kind="none" polls=0 why
+  budget="$(sanitise_positive_int "$CANARY_PUBLICATION_READY_SECS" 300)"
+  poll="$(sanitise_positive_int "$CANARY_PUBLICATION_POLL_SECS" 10)"
+  deadline=$(( $(date +%s) + budget ))
+  log "publication readiness: waiting up to ${budget}s for $RELEASES_LATEST_URL to serve '$expected' before any node boot. The caller's expected version is fixed; an observed tag cannot replace it."
+  while :; do
+    now=$(date +%s)
+    if [ "$now" -ge "$deadline" ]; then
+      break
+    fi
+    remaining=$((deadline - now))
+    # Cap a single request at 30s AND at whatever budget is left. `--max-time 0`
+    # would disable curl's timeout, so a sub-second remainder is not a request.
+    if [ "$remaining" -lt 1 ]; then
+      break
+    fi
+    if [ "$remaining" -gt 30 ]; then
+      max_time=30
+    else
+      max_time=$remaining
+    fi
+    polls=$((polls + 1))
+    tag="$(resolve_expected_latest "$max_time" 0)" && rc=0 || rc=$?
+    if [ "$rc" -eq 0 ]; then
+      observed="$tag"
+      if [ "$tag" = "$expected" ]; then
+        log "publication ready: $RELEASES_LATEST_URL redirects to '$expected' (observation $polls)."
+        return 0
+      fi
+      if is_dotted_version "$tag"; then
+        last_kind=stale
+        note "publication not ready: releases/latest is '$tag', expected '$expected'. A valid older or different tag is propagation lag, not a parser fault. The expected version is unchanged."
+      else
+        last_kind=malformed
+        observed="$tag"
+        note "publication not ready: releases/latest redirected to '$tag', which is not a bare dotted version. That is an unusable observation, not a proven network outage, and not a parser fault. Expected '$expected'."
+      fi
+    elif [ "$rc" -eq 2 ]; then
+      last_kind=malformed
+      observed="<unusable redirect>"
+      note "publication not ready: $RELEASES_LATEST_URL did not redirect to a /releases/tag/ URL. That is an unusable observation, not a proven network outage. Expected '$expected'."
+    else
+      last_kind=unreachable
+      observed="<request failed>"
+      note "publication not ready: the latest-release request failed. A failed request does not establish readiness. Expected '$expected'."
+    fi
+    now=$(date +%s)
+    if [ "$now" -ge "$deadline" ]; then
+      break
+    fi
+    remaining=$((deadline - now))
+    if [ "$remaining" -lt 1 ]; then
+      break
+    fi
+    if [ "$poll" -lt "$remaining" ]; then
+      sleep "$poll"
+    else
+      # Not enough budget left for another gap plus a useful request.
+      sleep "$remaining"
+      break
+    fi
+  done
+  case "$last_kind" in
+    stale)
+      why="A valid older or different tag is a propagation observation, not a parser fault. The expected version was not replaced."
+      ;;
+    malformed)
+      why="The last observation was malformed or unusable. That is not a proven network outage, and it does not establish readiness. The expected version was not replaced."
+      ;;
+    unreachable)
+      why="The last latest-release request failed, so no release tag was observed. A failed request does not establish readiness. The expected version was not replaced."
+      ;;
+    *)
+      why="No usable observation was recorded. The expected version was not replaced."
+      ;;
+  esac
+  fail "UNVERIFIED (ENVIRONMENTAL): publication not ready within ${budget}s. Expected releases/latest to be '${expected}'; last observed '${observed}'. ${why} The previous binary was not booted, so this is not a successful self-update and not a broken comparator. Re-run the job, or investigate if '${expected}' never became GitHub's latest."
+  return "$EXIT_UNVERIFIED_ENVIRONMENTAL"
+}
+
 # ---------------------------------------------------------------------------
 # Gate B: selfupdate -- end-to-end, after publication.
 #
@@ -1577,11 +1741,11 @@ cmd_selfupdate() {
   starting="$("$work/bin/freenet" --version | head -1)"
   log "starting from: $starting"
 
-  # Arm the positive-equality check, as Gate A does. Gate B runs AFTER
-  # publication, so `releases/latest` IS this release: the previous release's
-  # binary must observe `expected_version`, and there is no need to re-resolve
-  # it from GitHub -- the caller already knows which release it just published,
-  # and asking again would only introduce a second source allowed to disagree.
+  # Arm the positive-equality check from the version the caller just published.
+  # That value is the assertion target. Do not re-resolve it: a second source
+  # would be allowed to disagree, and the gate would either fail a release that
+  # is not a bug or silently adopt some other tag as the thing it claims to
+  # have tested. Visibility is a different question and is the wait below.
   #
   # Without this the deliberately-loud "CANARY_EXPECTED_LATEST is unset" NOTE
   # fired on EVERY healthy Gate B run (the command runs in its own process, so
@@ -1597,6 +1761,29 @@ cmd_selfupdate() {
   else
     unset CANARY_EXPECTED_LATEST
     note "NOTE: v$prev_version predates the observed-latest log line (#5236, first emitted by v$MARKER_LATEST_SEEN_SINCE), so Gate B's positive-equality check is SKIPPED. It arms itself once the previous release is v$MARKER_LATEST_SEEN_SINCE or newer; no action needed."
+  fi
+
+  # Publication readiness, before the first node boot (#5715).
+  #
+  # The previous binary fetches the same redirect this wait polls. For a
+  # short window after publication that redirect can still name the previous
+  # tag: v0.2.136's canary failed because the binary observed v0.2.135, and
+  # the same binary then detected v0.2.136 on its own. Scoring that as a
+  # broken comparator is a false red.
+  #
+  # The expected version armed above is not evidence the redirect has caught
+  # up, and a caller who exported it cannot skip this. A previous binary that
+  # predates the observed-latest marker still waits, and the installed-version
+  # check at the bottom of this function still has to pass: skipping the log
+  # equality check is not skipping the fleet transition.
+  #
+  # The wait does not prove every CDN edge agrees with this runner. The node's
+  # equality check stays strict for that reason. Exhausting the wait is
+  # UNVERIFIED (exit 75), does not boot the node, and is not a detection fault.
+  await_publication_ready "$expected_version"
+  local ready_rc=$?
+  if [ "$ready_rc" -ne 0 ]; then
+    return "$ready_rc"
   fi
 
   # RETRY the environmental cases, exactly as Gate A does. Gate B had NO retry
@@ -1857,7 +2044,9 @@ Usage:
 
   auto-update-canary.sh selfupdate <prev-version> <expected-version>
       Gate B (post-publish): the previous release self-updates to this one,
-      end to end. Versions are bare semver, no leading "v".
+      end to end. Versions are bare semver, no leading "v". Waits until
+      /releases/latest serves <expected-version> (up to about five minutes)
+      before booting the previous binary.
 
   auto-update-canary.sh assert-logs <log-dir>
       Run just the two-sided log assertion over an existing log directory.
