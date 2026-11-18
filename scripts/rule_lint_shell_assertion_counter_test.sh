@@ -21,10 +21,10 @@
 # file are where the real numbers live, and they fail naming the files.
 #
 # Nothing in the repo exercised the regex, so each of those misses was found by
-# a human noticing a wrong number rather than by CI. The failure direction is
-# the bad one: an under-counting lint REJECTS a `fix:` PR that does have a
-# regression test, and the path of least resistance for the author is to reshape
-# a good test until the grep likes it, or to reach for `test-exempt`.
+# a human noticing a wrong number rather than by CI. An under-count warns on a
+# `fix:` PR that does have a regression test — it used to reject — and the path
+# of least resistance for the author is to reshape a good test until the grep
+# likes it, or to reach for `test-exempt`.
 #
 # WHAT IT PINS. Not the regex text -- that would be a copy, and a copy is
 # rewritten by the same edit it is supposed to guard (the failure mode #5303
@@ -32,6 +32,11 @@
 # against call-site shapes taken verbatim from the repo's own test files, in
 # both directions. A widening that starts matching plumbing, and a narrowing
 # that stops matching an existing convention, both fail here.
+#
+# It also runs the live rule 5 block — the all-zero branch through the shared
+# ERRORS check — against a throwaway repo. A fix: diff that adds no test the
+# counter can see must warn once and exit zero; an earlier violation must
+# still fail the step.
 #
 # Run manually: bash scripts/rule_lint_shell_assertion_counter_test.sh
 # Also wired into CI (the Fmt job in .github/workflows/ci.yml).
@@ -104,7 +109,7 @@ expect() {
         if [[ "$want" == 1 ]]; then
             echo "       This is a convention the repo's *_test.sh files ALREADY use, so a" >&2
             echo "       fix: PR whose regression test is written this way now scores zero" >&2
-            echo "       and is rejected for having no test. Widen the alternation in" >&2
+            echo "       and the missing-test warning fires. Widen the alternation in" >&2
             echo "       ci.yml rather than reshaping the test." >&2
         else
             echo "       The counter now scores a line that is not an assertion, so a fix:" >&2
@@ -195,8 +200,8 @@ expect 0 "a bare string added to a table (a KNOWN blind spot, documented in ci.y
 
 # 1. EVERY *_test.sh the counter can see must contain at least one line it
 #    recognises. A file scoring zero means the counter cannot see that file's
-#    convention AT ALL, so a `fix:` PR whose only regression test lives there is
-#    rejected for having no test. This is not hypothetical: when
+#    convention AT ALL, so a `fix:` PR whose only regression test lives there
+#    draws the missing-test warning. This is not hypothetical: when
 #    THIS file was added, its 26 bare `expect` calls scored zero -- the miss it
 #    exists to prevent, in the file written to prevent it, caught by measuring.
 invisible=()
@@ -355,7 +360,7 @@ else
     echo "FAIL - these *_test.sh files are INVISIBLE to the shell-assertion counter:" >&2
     for f in "${invisible[@]}"; do echo "         $f" >&2; done
     echo "       A fix: PR whose only regression test is in one of them scores zero and" >&2
-    echo "       is rejected for having no test. Either the file uses a convention the" >&2
+    echo "       the missing-test warning fires. Either the file uses a convention the" >&2
     echo "       alternation does not know, or it has no assertions at all. Widen the" >&2
     echo "       alternation in ci.yml -- do not reshape the tests to please the grep." >&2
     FAILURES=$((FAILURES + 1))
@@ -441,7 +446,7 @@ if [[ ${#uncovered[@]} -gt 0 ]]; then
     echo "FAIL - these shell self-tests are outside ci.yml's NEW_SHELL_TESTS pathspecs:" >&2
     for f in "${uncovered[@]}"; do echo "         $f" >&2; done
     echo "       The counter never sees their added lines, so a fix: PR whose only" >&2
-    echo "       regression test lives there is rejected for having no test -- however" >&2
+    echo "       regression test lives there draws the missing-test warning -- however" >&2
     echo "       many assertions it adds. Add a pathspec to the git diff in ci.yml." >&2
     FAILURES=$((FAILURES + 1))
 elif [[ "$pathspec_measured" -eq 1 ]]; then
@@ -454,18 +459,19 @@ fi
 # 1c. ...and the count must still be CONSUMED by the gate.
 #    Everything above measures how the number is COMPUTED. None of it notices if
 #    the number stops being read. Deleting `&& [ "$NEW_SHELL_TESTS" -eq 0 ]`
-#    from the gate condition -- the obvious "simplify this" edit -- restores
-#    PR #4958's exact failure (a fix: PR whose only regression test is a shell
-#    self-test is rejected for having none) while every other assertion in this
-#    file stays green. Found by review, not by the author's own battery.
+#    from the gate condition -- the obvious "simplify this" edit -- makes a
+#    fix: PR whose only regression test is a shell self-test draw the
+#    missing-test warning (PR #4958 was rejected for that) while every other
+#    assertion in this file stays green. Found by review, not by the author's
+#    own battery.
 if grep -qE '\[ "\$NEW_SHELL_TESTS" -eq 0 \]' "$CI_YML" \
    && grep -qE 'if \[ "\$NEW_TESTS" -eq 0 \].*NEW_SHELL_TESTS.*NEW_JS_TESTS' "$CI_YML"; then
     echo "ok   - the fix: gate still consumes NEW_SHELL_TESTS"
 else
     echo "FAIL - ci.yml's fix:-needs-a-test condition no longer reads NEW_SHELL_TESTS." >&2
     echo "       The count would be computed and thrown away, so a fix: PR whose only" >&2
-    echo "       regression test is a shell self-test is rejected for having none --" >&2
-    echo "       PR #4958's failure, restored. Expected all three counters in one" >&2
+    echo "       regression test is a shell self-test draws the missing-test warning --" >&2
+    echo "       PR #4958 was rejected for that. Expected all three counters in one" >&2
     echo "       condition: NEW_TESTS, NEW_SHELL_TESTS, NEW_JS_TESTS." >&2
     FAILURES=$((FAILURES + 1))
 fi
@@ -500,6 +506,137 @@ else
     echo "       'pass \"...\"' and 'check_eq \"...\"' call sites both score. A helper" >&2
     echo "       definition scoring zero is correct, not a blind spot.)" >&2
     FAILURES=$((FAILURES + 1))
+fi
+
+# --- Rule 5: no new test is a warning, not a failed step -------------------
+# The counter above only sees ADDED lines, so a regression test already on
+# the base branch scores zero. Rule 5 used to append an ERROR for that and
+# fail the step (#6229), even when that existing test had caught the bug.
+# This runs the LIVE block extracted from ci.yml, labels substituted for the
+# one GitHub expression bash cannot evaluate, through the shared ERRORS check.
+rule5_block="$(awk '
+    /TEST_ATTR_RE=/ { capture = 1 }
+    capture { print }
+    /Rule lint passed/ { exit }
+' "$WF")"
+if [[ -z "$rule5_block" ]] \
+    || ! grep -q 'NEW_SHELL_TESTS' <<< "$rule5_block" \
+    || ! grep -q 'pull_request.labels' <<< "$rule5_block" \
+    || ! grep -q 'if \[ -n "\$ERRORS" \]' <<< "$rule5_block"; then
+    echo "FAIL - could not extract rule 5 through the shared ERRORS check from ci.yml." >&2
+    echo "       A fix: PR with no new test would no longer be exercised by this file." >&2
+    FAILURES=$((FAILURES + 1))
+else
+    rule5_root="$(mktemp -d)" || exit 1
+    trap 'rm -rf "$rule5_root"' EXIT
+
+    rule5_commit() {
+        local dir="$1" msg="$2"
+        shift 2
+        git -C "$dir" -c user.email=rule-lint@example.com -c user.name='Rule Lint Test' \
+            -c commit.gpgsign=false commit -q -m "$msg" "$@"
+    }
+
+    rule5_run() {
+        local title="$1" labels="$2" errors="$3" repo="$4" base="$5" head="$6"
+        local script out rc
+        script="$(printf '%s\n' "$rule5_block" | sed "s|\${{ join(github.event.pull_request.labels.\\*\\.name, ',') }}|${labels}|")"
+        if grep -q 'pull_request.labels' <<< "$script"; then
+            RULE5_OUT="label expression was not substituted"
+            RULE5_RC=99
+            return
+        fi
+        # A fresh bash: this file's pipefail must not change the step's own
+        # pipeline status, and `exit 1` in the shared check must be the step's.
+        out="$(
+            PR_TITLE="$title" RULE5_ERRORS="$errors" BASE="$base" HEAD="$head" RULE5_SCRIPT="$script" \
+                bash -c 'cd "$1" || exit 99; ERRORS="$RULE5_ERRORS"; eval "$RULE5_SCRIPT"' _ "$repo"
+        )"
+        rc=$?
+        RULE5_OUT="$out"
+        RULE5_RC="$rc"
+    }
+
+    # rule5_expect <exit> <warning count> <violation still required, or empty> <desc> ...
+    rule5_expect() {
+        local want_rc="$1" want_warnings="$2" violation="$3" desc="$4"
+        shift 4
+        local warnings=0 warning_lines="" bad=0
+        rule5_run "$@"
+        warnings="$(grep -c '::warning::' <<< "$RULE5_OUT" || true)"
+        warning_lines="$(grep '::warning::' <<< "$RULE5_OUT" || true)"
+        if [[ "$RULE5_RC" -ne "$want_rc" || "$warnings" -ne "$want_warnings" ]]; then
+            bad=1
+        fi
+        # The one warning has to say both things the author can do. A bare
+        # `::warning::` would satisfy the count and document nothing.
+        if [[ "$want_warnings" -eq 1 ]] \
+            && { ! grep -q 'existing regression test' <<< "$warning_lines" \
+                || ! grep -q 'add coverage' <<< "$warning_lines"; }; then
+            bad=1
+        fi
+        # Exit zero is only success if the shared check's pass path ran.
+        if [[ "$want_rc" -eq 0 ]] && ! grep -q 'Rule lint passed' <<< "$RULE5_OUT"; then
+            bad=1
+        fi
+        # An earlier violation must still be the shared check's failure, not
+        # a new message that replaced it.
+        if [[ -n "$violation" ]] \
+            && { ! grep -qF -- "$violation" <<< "$RULE5_OUT" \
+                || ! grep -q '::error::Rule lint failed' <<< "$RULE5_OUT"; }; then
+            bad=1
+        fi
+        if [[ "$bad" -eq 0 ]]; then
+            echo "ok   - $desc"
+            return
+        fi
+        echo "FAIL - $desc" >&2
+        echo "         wanted exit $want_rc and $want_warnings missing-test warning(s)" >&2
+        echo "         got exit $RULE5_RC and $warnings warning(s)" >&2
+        if [[ -n "$violation" ]]; then
+            echo "         and the original violation still reported: $violation" >&2
+        fi
+        printf '%s\n' "$RULE5_OUT" | sed 's/^/         output: /' >&2
+        FAILURES=$((FAILURES + 1))
+    }
+
+    empty="$rule5_root/empty"
+    mkdir -p "$empty"
+    git -C "$empty" init -q
+    rule5_commit "$empty" base --allow-empty
+    empty_sha="$(git -C "$empty" rev-parse HEAD)"
+
+    added="$rule5_root/added"
+    mkdir -p "$added/scripts"
+    git -C "$added" init -q
+    printf '%s\n' '# baseline' > "$added/scripts/widget_test.sh"
+    git -C "$added" add scripts/widget_test.sh
+    rule5_commit "$added" base
+    added_base="$(git -C "$added" rev-parse HEAD)"
+    printf '%s\n' 'check "covers the bug" 0 0' >> "$added/scripts/widget_test.sh"
+    git -C "$added" add scripts/widget_test.sh
+    rule5_commit "$added" head
+    added_head="$(git -C "$added" rev-parse HEAD)"
+
+    rule5_expect 0 1 "" \
+        "fix title, empty diff, empty ERRORS: exit zero and one missing-test warning" \
+        "fix: note the existing floor" "" "" "$empty" "$empty_sha" "$empty_sha"
+    rule5_expect 1 1 "ERROR: earlier banned pattern" \
+        "an earlier violation still fails the step, and the warning is still emitted" \
+        "fix: note the existing floor" "" "ERROR: earlier banned pattern" \
+        "$empty" "$empty_sha" "$empty_sha"
+    rule5_expect 0 1 "" \
+        "a scoped fix title triggers the missing-test warning" \
+        "fix(rule-lint): note the existing floor" "" "" "$empty" "$empty_sha" "$empty_sha"
+    rule5_expect 0 0 "" \
+        "an added shell assertion the counter scores suppresses the warning" \
+        "fix: note the existing floor" "" "" "$added" "$added_base" "$added_head"
+    rule5_expect 0 0 "" \
+        "a non-fix title suppresses the warning" \
+        "chore: refresh a comment" "" "" "$empty" "$empty_sha" "$empty_sha"
+    rule5_expect 0 0 "" \
+        "the test-exempt label suppresses the warning" \
+        "fix: note the existing floor" "test-exempt" "" "$empty" "$empty_sha" "$empty_sha"
 fi
 
 echo

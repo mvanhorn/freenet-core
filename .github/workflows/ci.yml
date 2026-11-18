@@ -362,10 +362,10 @@ jobs:
       # Guards the shell-assertion counter further down THIS file. That
       # alternation has been wrong three times and nothing in the repo
       # exercised it, so each miss was found by a human noticing a wrong
-      # number. It fails in the rejecting direction: an under-counting lint
-      # turns away a fix: PR that does have a regression test, and the cheapest
-      # response for the author is to reshape a good test until the grep likes
-      # it. The test extracts the live regex rather than copying it.
+      # number. An under-count warns on a fix: PR that does have a regression
+      # test — it used to reject — and the cheapest response for the author is
+      # to reshape a good test until the grep likes it. The test extracts the
+      # live regex rather than copying it.
       - name: Self-test Rule Lint shell-assertion counter
         run: bash scripts/rule_lint_shell_assertion_counter_test.sh
 
@@ -630,7 +630,7 @@ jobs:
             NEW_TESTS=$(echo "$ALL_ADDED_STRIPPED" | grep -cE "$TEST_ATTR_RE" || true)
             # Some fixes are to shell tooling, whose regression tests are shell
             # *_test.sh self-tests, not Rust #[test]s. Without this they score
-            # zero against TEST_ATTR_RE and the fix is wrongly rejected — the gap
+            # zero against TEST_ATTR_RE and the missing-test warning fires — the gap
             # that hid the announce-to-river fix's own test.
             #
             # WHAT THIS RECOGNISES, precisely: the SUCCESS-REPORTING LINE of an
@@ -736,7 +736,7 @@ jobs:
             # Playwright `*.spec.ts` — they are never Rust `#[test]`s, because
             # the code under test is JavaScript the Rust suite cannot execute.
             # Without this a `fix:` PR carrying real, mutation-tested browser
-            # coverage scores zero and is rejected.
+            # coverage scores zero and the missing-test warning fires.
             #
             # VOCABULARY IS ENUMERATED, not guessed from the file in front of
             # me — the comment above records that guessing is how the shell
@@ -758,24 +758,10 @@ jobs:
               | grep -E '^\+' | grep -vF '+++' \
               | grep -cE '^\+[[:space:]]*(await[[:space:]]+)?(check|expect|test|ok|eq)[[:space:]]*\(' || true)
             if [ "$NEW_TESTS" -eq 0 ] && [ "$NEW_SHELL_TESTS" -eq 0 ] && [ "$NEW_JS_TESTS" -eq 0 ]; then
-              ERRORS="$ERRORS
-          ERROR: fix: PR must include at least one new regression test
-          Add a test that reproduces the bug (fails without fix, passes with fix).
-          Either satisfies this:
-            - a Rust #[test] / #[tokio::test] / etc.
-            - an added assertion in a Node *.test.mjs or Playwright *.spec.ts:
-              'check(...)', 'expect(...)', 'test(...)', 'ok(...)' or 'eq(...)'.
-              Browser-asset fixes have no Rust test to add — the Rust suite
-              cannot execute the JavaScript it serves.
-            - an added assertion in a *_test.sh self-test, written with any of the
-              conventions those files use: 'check ...', 'ok ...', 'pass ...',
-              'expect ...', a 'check_'/'pin_'/'assert_'/'expect_'/'test_'-prefixed helper, a
-              '*_case ...' helper, 'echo \"ok   - ...\"' or 'echo \"PASS ...\"'.
-              Known blind spots: an assertion whose only added line is its FAIL
-              branch, and a new entry in a table an existing assertion loops over
-              (e.g. SIGPIPE_SCRIPTS). If you have a real test the counter cannot
-              see, say so on the PR rather than reshaping the test to please this grep.
-          If this fix genuinely cannot have a test, add the 'test-exempt' label with a justification comment."
+              # Advisory (#6229). Added lines cannot show a regression test that
+              # already exists on the base branch. Warn once and leave ERRORS
+              # alone, so any earlier violation still reaches the check below.
+              echo "::warning::fix: PR adds no new regression test. Identify an existing regression test that already covers this bug, or add coverage."
             fi
           fi
 

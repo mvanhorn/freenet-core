@@ -94,7 +94,9 @@ EVERY bug fix MUST include a regression test.
 3. Apply the fix
 4. Verify the test PASSES
 
-CI enforces this: fix: PRs without new test functions are rejected.
+Rule Lint does not reject a fix: PR that adds no new test. It emits a
+warning annotation: identify an existing regression test, or add coverage.
+The reviewer judges whether that coverage catches the bug.
 
 Also: don't just test the happy path. Test edge cases and boundary
 conditions. See .claude/rules/testing.md for specifics.

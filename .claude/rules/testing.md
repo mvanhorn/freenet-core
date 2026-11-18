@@ -41,7 +41,9 @@ WHEN fixing a bug:
   - It documents the failure mode (name describes the scenario)
   - Example: test_loss_pause_allows_packet_through, not test_loss_pause
 
-  CI will reject fix: PRs that don't add at least one new #[test] function.
+  Rule Lint does not reject a fix: PR that adds no new test. It emits a
+  warning annotation: identify an existing regression test, or add coverage.
+  The reviewer judges whether that coverage catches the bug.
 ```
 
 ### Edge cases and boundary conditions
